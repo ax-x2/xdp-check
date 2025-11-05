@@ -14,6 +14,9 @@ libc = "0.2"
 caps = "0.5"
 procfs = "0.18"
 
+# BPF program introspection
+aya = { version = "0.13.1", features = ["async_tokio"] }
+
 netlink-packet-core = "0.7"
 netlink-packet-route = "0.20"
 netlink-sys = "0.8"

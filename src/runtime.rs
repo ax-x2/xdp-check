@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
+use aya::programs::loaded_programs;
 
 use crate::output::{CheckResult, CheckStatus};
 
@@ -21,122 +22,67 @@ pub fn check_xdp_runtime(interface: Option<&str>) -> Result<Vec<CheckResult>> {
 }
 
 fn check_all_xdp_runtime() -> Result<Vec<CheckResult>> {
-    let mut results = Vec::new();
-    let mut xdp_active = Vec::new();
-    let mut xdp_inactive = Vec::new();
-
-    for entry in fs::read_dir("/sys/class/net")? {
-        if let Ok(entry) = entry {
-            if let Some(name) = entry.file_name().to_str() {
-                if name == "lo" {
-                    continue;
-                }
-
-                let xdp_prog_path = format!("/sys/class/net/{}/xdp/prog_id", name);
-                if Path::new(&xdp_prog_path).exists() {
-                    if let Ok(prog_id) = fs::read_to_string(&xdp_prog_path) {
-                        let prog_id = prog_id.trim();
-                        if prog_id != "0" && !prog_id.is_empty() {
-                            xdp_active.push(format!("{} (prog_id: {})", name, prog_id));
-                        } else {
-                            xdp_inactive.push(name.to_string());
-                        }
-                    }
-                } else {
-                    xdp_inactive.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    let status = if !xdp_active.is_empty() {
-        CheckStatus::Pass
-    } else {
-        CheckStatus::Info
-    };
-
-    results.push(CheckResult {
-        name: "Active XDP Programs".to_string(),
-        status,
-        message: format!("{} interface(s) with XDP programs", xdp_active.len()),
-        details: if !xdp_active.is_empty() {
-            Some(format!("Active on: {}", xdp_active.join(", ")))
-        } else {
-            Some("No XDP programs currently attached to any interface".to_string())
-        },
-    });
-
-    Ok(results)
+    Ok(Vec::new())
 }
 
 fn check_interface_xdp_runtime(interface: &str) -> Result<Vec<CheckResult>> {
     let mut results = Vec::new();
 
-    let xdp_prog_path = format!("/sys/class/net/{}/xdp/prog_id", interface);
+    log::debug!("Checking XDP runtime for interface: {}", interface);
 
-    if Path::new(&xdp_prog_path).exists() {
-        if let Ok(prog_id) = fs::read_to_string(&xdp_prog_path) {
-            let prog_id = prog_id.trim();
-            if prog_id != "0" && !prog_id.is_empty() {
-                results.push(CheckResult {
-                    name: format!("{}: XDP Program", interface),
-                    status: CheckStatus::Pass,
-                    message: format!("XDP program active (ID: {})", prog_id),
-                    details: Some("XDP program is currently attached and running".to_string()),
-                });
+    // Check if interface exists
+    let iface_path = format!("/sys/class/net/{}", interface);
+    if !Path::new(&iface_path).exists() {
+        results.push(CheckResult {
+            name: format!("{}: Interface", interface),
+            status: CheckStatus::Warning,
+            message: "Interface not found".to_string(),
+            details: Some(format!("Network interface '{}' does not exist", interface)),
+        });
+        return Ok(results);
+    }
 
-                // Try to get more info about the program
-                let prog_info = bpf_prog_info(prog_id);
-                if let Some(info) = prog_info {
-                    results.push(CheckResult {
-                        name: format!("{}: XDP Program Info", interface),
-                        status: CheckStatus::Info,
-                        message: "Program details".to_string(),
-                        details: Some(info),
-                    });
-                }
-            } else {
-                results.push(CheckResult {
-                    name: format!("{}: XDP Program", interface),
-                    status: CheckStatus::Info,
-                    message: "No XDP program attached".to_string(),
-                    details: None,
-                });
-            }
+    // Query all XDP programs to see if any are loaded
+    let xdp_programs: Vec<_> = loaded_programs()
+        .filter_map(|r| r.ok())
+        .filter(|p| {
+            matches!(p.program_type(), Ok(aya::programs::ProgramType::Xdp))
+        })
+        .collect();
+
+    if xdp_programs.is_empty() {
+        results.push(CheckResult {
+            name: format!("{}: XDP Program", interface),
+            status: CheckStatus::Info,
+            message: "No XDP programs loaded in the system".to_string(),
+            details: None,
+        });
+        return Ok(results);
+    }
+
+    // Find agave_xdp programs
+    let agave_programs: Vec<_> = xdp_programs
+        .iter()
+        .filter(|p| p.name_as_str().unwrap_or("") == "agave_xdp")
+        .collect();
+
+    if !agave_programs.is_empty() {
+        for prog in agave_programs {
+            let tag = format!("{:016x}", prog.tag());
+            results.push(CheckResult {
+                name: format!("{}: XDP Program", interface),
+                status: CheckStatus::Pass,
+                message: format!("agave_xdp program loaded (ID: {})", prog.id()),
+                details: Some(format!("Program Tag: {}\nType: XDP", tag)),
+            });
         }
     } else {
         results.push(CheckResult {
-            name: format!("{}: XDP Runtime", interface),
+            name: format!("{}: XDP Program", interface),
             status: CheckStatus::Warning,
-            message: "Unable to check XDP status".to_string(),
-            details: Some("XDP status file not found. Interface may not support XDP.".to_string()),
+            message: format!("{} XDP program(s) loaded, but none named 'agave_xdp'", xdp_programs.len()),
+            details: Some("Other XDP programs found but 'agave_xdp' is not loaded".to_string()),
         });
-    }
-
-    // XDP mode (native/generic/offload)
-    let xdp_mode_path = format!("/sys/class/net/{}/xdp/mode", interface);
-    if Path::new(&xdp_mode_path).exists() {
-        if let Ok(mode) = fs::read_to_string(&xdp_mode_path) {
-            let mode = mode.trim();
-            let mode_status = match mode {
-                "native" | "driver" => CheckStatus::Pass,
-                "generic" | "skb" => CheckStatus::Warning,
-                "offload" | "hw" => CheckStatus::Pass,
-                _ => CheckStatus::Info,
-            };
-
-            results.push(CheckResult {
-                name: format!("{}: XDP Mode", interface),
-                status: mode_status,
-                message: format!("XDP mode: {}", mode),
-                details: match mode {
-                    "native" | "driver" => Some("Native/Driver mode - best performance".to_string()),
-                    "generic" | "skb" => Some("Generic/SKB mode - slower, fallback mode".to_string()),
-                    "offload" | "hw" => Some("Hardware offload - NIC processes XDP".to_string()),
-                    _ => None,
-                },
-            });
-        }
     }
 
     Ok(results)
@@ -184,35 +130,66 @@ fn check_xsk_sockets() -> CheckResult {
 fn check_bpf_programs() -> Result<Vec<CheckResult>> {
     let mut results = Vec::new();
 
-    // check if bpftool is available for detailed info
-    let bpftool_available = std::process::Command::new("which")
-        .arg("bpftool")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    log::debug!("Querying loaded XDP programs via aya");
 
-    if bpftool_available {
-        // try to list XDP programs using bpftool
-        if let Ok(output) = std::process::Command::new("bpftool")
-            .args(&["prog", "list", "type", "xdp"])
-            .output()
-        {
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                let prog_count = output_str.lines().count();
+    // Use aya to list XDP programs
+    let xdp_programs: Vec<_> = loaded_programs()
+        .filter_map(|r| r.ok())
+        .filter(|p| {
+            matches!(p.program_type(), Ok(aya::programs::ProgramType::Xdp))
+        })
+        .collect();
 
-                results.push(CheckResult {
-                    name: "BPF Programs (XDP)".to_string(),
-                    status: if prog_count > 0 { CheckStatus::Pass } else { CheckStatus::Info },
-                    message: format!("{} XDP program(s) loaded", prog_count),
-                    details: if prog_count > 0 {
-                        Some("Use 'bpftool prog list type xdp' for details".to_string())
-                    } else {
-                        None
-                    },
-                });
-            }
+    log::debug!("Found {} XDP program(s)", xdp_programs.len());
+
+    // Find agave_xdp programs
+    let agave_programs: Vec<_> = xdp_programs
+        .iter()
+        .filter(|p| p.name_as_str().unwrap_or("") == "agave_xdp")
+        .collect();
+
+    // Report on agave_xdp programs
+    if !agave_programs.is_empty() {
+        for prog in &agave_programs {
+            let tag = format!("{:016x}", prog.tag());
+            let details = format!(
+                "Program ID: {}\nProgram Tag: {}\nType: XDP",
+                prog.id(),
+                tag
+            );
+
+            results.push(CheckResult {
+                name: "Agave XDP Program".to_string(),
+                status: CheckStatus::Pass,
+                message: format!("agave_xdp is loaded and active (ID: {})", prog.id()),
+                details: Some(details),
+            });
+
+            log::debug!("  ✓ agave_xdp: ID {} tag {}", prog.id(), tag);
         }
+    } else if !xdp_programs.is_empty() {
+        // Other XDP programs exist but no agave_xdp
+        results.push(CheckResult {
+            name: "Agave XDP Program".to_string(),
+            status: CheckStatus::Warning,
+            message: format!("{} XDP program(s) loaded, but none named 'agave_xdp'", xdp_programs.len()),
+            details: Some("Other XDP programs detected but 'agave_xdp' not found".to_string()),
+        });
+
+        for prog in &xdp_programs {
+            log::debug!("  - Other XDP Program: ID {} name '{}'",
+                prog.id(),
+                prog.name_as_str().unwrap_or("?")
+            );
+        }
+    } else {
+        // No XDP programs at all
+        results.push(CheckResult {
+            name: "Agave XDP Program".to_string(),
+            status: CheckStatus::Info,
+            message: "No XDP programs currently loaded".to_string(),
+            details: None,
+        });
     }
 
     // check /sys/fs/bpf for pinned programs
@@ -252,23 +229,4 @@ fn check_bpf_programs() -> Result<Vec<CheckResult>> {
     }
 
     Ok(results)
-}
-
-/// BPF program info (if available)
-fn bpf_prog_info(prog_id: &str) -> Option<String> {
-    // try to get program info from /proc/self/fdinfo if we have access
-    // alternatrive: check if bpftool is available
-    if let Ok(output) = std::process::Command::new("bpftool")
-        .args(&["prog", "show", "id", prog_id])
-        .output()
-    {
-        if output.status.success() {
-            let info = String::from_utf8_lossy(&output.stdout);
-            if !info.is_empty() {
-                return Some(info.lines().next()?.to_string());
-            }
-        }
-    }
-
-    None
 }
